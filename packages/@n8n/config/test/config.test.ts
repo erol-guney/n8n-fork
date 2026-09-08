@@ -375,6 +375,7 @@ describe('GlobalConfig', () => {
 			canvasNodeContextEnabled: false,
 			instanceAiSetupPanelEnabled: false,
 			nodeUsageEnabled: false,
+			folderExplorationEnabled: false,
 			activationCapped: false,
 			activationLockMessageThreshold: 1,
 			maxConcurrentRuns: -1,
