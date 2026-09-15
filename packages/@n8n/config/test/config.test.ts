@@ -283,6 +283,7 @@ describe('GlobalConfig', () => {
 				workflowInfoMetricInterval: 60,
 				includeDbPoolMetrics: false,
 				includeWorkflowPublicationMetrics: false,
+				includeMcpPostSaveMetrics: false,
 				workflowPublicationMetricInterval: 60,
 			},
 			additionalNonUIRoutes: '',
@@ -348,6 +349,7 @@ describe('GlobalConfig', () => {
 			browserUseEnabled: true,
 			observerMessageTokens: 30_000,
 			reflectorObservationTokens: 40_000,
+			midRunObservation: false,
 			sandboxEnabled: false,
 			sandboxProvider: 'n8n-sandbox',
 			sandboxImage: 'daytonaio/sandbox:0.5.0',
@@ -674,6 +676,7 @@ describe('GlobalConfig', () => {
 		},
 		expressionEngine: {
 			engine: 'vm',
+			frontendEngine: 'legacy',
 			poolSize: 1,
 			maxCodeCacheSize: 1024,
 			bridgeTimeout: 5000,
