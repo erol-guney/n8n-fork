@@ -1,0 +1,801 @@
+name: Avalara
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    # 14:00 UTC = 6:00 AM Pacific (PST) or 7:00 AM Pacific (PDT)
+    - cron: '0 14 * * *'
+    # 02:00 UTC = 6:00 PM Pacific (PST) or 7:00 PM Pacific (PDT)
+    - cron: '0 2 * * *'
+
+# Prevent multiple concurrent runs
+concurrency:
+  group: avalara-sync-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+# Opt into Node.js 24 for JavaScript actions; use actions/checkout@v5 which supports Node 24
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  start:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Print workflow information
+        run: |
+          echo "=== AVALARA SYNC WORKFLOW ==="
+          echo ""
+          echo "Execution Details:"
+          echo "  Started: $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+          echo "  Triggered: ${{ github.event_name == 'workflow_dispatch' && 'Manual' || 'Scheduled' }}"
+          echo "  Actor: ${{ github.actor }}"
+          echo "  Run: #${{ github.run_number }} (ID: ${{ github.run_id }})"
+          echo ""
+          echo "Sync Operations:"
+          echo "  1. sync_automation       → Sync automation branch from upstream master"
+          echo "  2. sync_master           → Fast-forward master from upstream"
+          echo "  3. sync_avalara_dev      → Merge upstream master into avalara-dev, build, and run unit tests"
+          echo "  4. build_latest_release  → Reset latest-release from latest upstream release/2.X.X, build, and run unit tests"
+          echo "  5. build_avalara_release → Reset avalara-release from latest upstream release/2.X.X + apply avalara delta from avalara-dev"
+          echo ""
+          echo "Target Branches:"
+          echo "  - automation (preserves avalara workflows)"
+          echo "  - master (fast-forward only)"
+          echo "  - avalara-dev (master + avalara features)"
+          echo "  - latest-release (mirrors latest upstream release/2.X.X)"
+          echo "  - avalara-release (latest upstream release/2.X.X + avalara features from avalara-dev)"
+          echo ""
+          echo "Repository: ${{ github.repository }}"
+          echo "Ref: ${{ github.ref }}"
+          echo "Commit: ${{ github.sha }}"
+          echo ""
+          echo "=========================================="
+
+  # Automation Branch sync job
+  sync_automation:
+    needs: [start]
+    runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0 # we need history to fast-forward
+          token: ${{ secrets.SYNC_PAT }}
+
+      - name: Checkout automation branch
+        run: |
+          git checkout -B automation origin/automation || git checkout automation
+
+      - name: Configure git
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+      
+      - name: Add upstream and fetch latest
+        run: |
+          # Add upstream remote if it doesn't exist
+          if ! git remote get-url upstream >/dev/null 2>&1; then
+            git remote add upstream https://github.com/n8n-io/n8n.git
+          fi
+          git fetch upstream master
+      
+      - name: Sync automation branch with upstream (preserving avalara workflows)
+        run: |
+          # Backup avalara workflow file and script
+          cp .github/workflows/avalara.yml /tmp/avalara.yml || true
+          cp .github/workflows/delete_avalara_runs.sh /tmp/delete_avalara_runs.sh || true
+          cp scripts/run-avalara-actions-local.sh /tmp/run-avalara-actions-local.sh || true
+          
+          # Hard reset to upstream master
+          git reset --hard upstream/master
+
+          # Restore avalara workflow file and script
+          cp /tmp/avalara.yml .github/workflows/avalara.yml || true
+          cp /tmp/delete_avalara_runs.sh .github/workflows/delete_avalara_runs.sh || true
+          mkdir -p scripts
+          cp /tmp/run-avalara-actions-local.sh scripts/run-avalara-actions-local.sh || true
+          
+          git add .github/workflows/avalara.yml 
+          git add .github/workflows/delete_avalara_runs.sh
+          git add scripts/run-avalara-actions-local.sh
+          git commit -m "sync: update automation branch from upstream (preserving avalara workflows)" || true
+      
+      - name: Push automation branch
+        run: |
+          git push origin automation --force
+        env:
+          GITHUB_TOKEN: ${{ secrets.SYNC_PAT }}
+
+  # Master Branch sync jobs
+  sync_master:
+    needs: [start]
+    runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0 # we need history to fast-forward
+          token: ${{ secrets.SYNC_PAT }}
+
+      - name: Checkout master branch
+        run: |
+          git checkout -B master origin/master || git checkout master
+
+      - name: Configure git
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+      - name: Add upstream and fetch latest
+        run: |
+          # Add upstream remote if it doesn't exist
+          if ! git remote get-url upstream >/dev/null 2>&1; then
+            git remote add upstream https://github.com/n8n-io/n8n.git
+          fi
+          git fetch upstream master
+      - name: Fast-forward fork/master to upstream/master
+        run: |
+          # fast-forward only (no merge commits, no force)
+          git merge --ff-only upstream/master
+      
+      - name: Setup and Build
+        uses: ./.github/actions/setup-nodejs
+        with:
+          install-command: 'pnpm install'
+
+      - name: Push (no-op if already up to date)
+        run: |
+          git push origin HEAD:master
+        env:
+          GITHUB_TOKEN: ${{ secrets.SYNC_PAT }}
+
+  # Sync avalara-dev branch from upstream master
+  sync_avalara_dev:
+    needs: [sync_automation, sync_master]
+    runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0 # we need history to merge
+          token: ${{ secrets.SYNC_PAT }}
+
+      - name: Checkout avalara-dev branch
+        run: |
+          # Check if avalara-dev branch exists locally
+          if git show-ref --verify --quiet refs/heads/avalara-dev; then
+            echo "Local avalara-dev branch exists"
+            git checkout avalara-dev
+          elif git show-ref --verify --quiet refs/remotes/origin/avalara-dev; then
+            echo "Remote avalara-dev branch exists, creating local branch"
+            git checkout -b avalara-dev origin/avalara-dev
+          else
+            echo "ERROR: avalara-dev branch does not exist locally or remotely"
+            exit 1
+          fi
+
+      - name: Configure git
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+      
+      - name: Add upstream and fetch latest
+        run: |
+          # Add upstream remote if it doesn't exist
+          if ! git remote get-url upstream >/dev/null 2>&1; then
+            git remote add upstream https://github.com/n8n-io/n8n.git
+          fi
+          git fetch upstream master
+      
+      - name: Refresh avalara-dev from master
+        run: |
+          # Check if already up to date with master
+          if git merge-base --is-ancestor upstream/master HEAD; then
+            echo "avalara-dev is already up to date with master"
+          else
+            echo "Merging master into avalara-dev"
+            if ! git merge upstream/master --no-edit; then
+              echo "Merge conflict detected. Attempting to resolve automatically..."
+              
+              # Check if there are any unmerged files
+              if git status --porcelain | grep -q "^UU\|^AA\|^DD"; then
+                echo "Resolving merge conflicts automatically..."
+                
+                # For each conflicted file, resolve conflicts by accepting changes from master (--theirs)
+                # since we're refreshing avalara-dev from master
+                git status --porcelain | grep "^UU\|^AA\|^DD" | while read -r _status file; do
+                  echo "  - Resolving conflict in: $file"
+                  # For package.json, we might want to preserve version, but for refresh we accept master
+                  # For other files, accept master's changes (--theirs) to refresh the codebase
+                  echo "    Accepting changes from master (--theirs)"
+                  git checkout --theirs "$file"
+                  git add "$file"
+                done
+                
+                # Complete the merge
+                if git commit --no-edit; then
+                  echo "Successfully resolved merge conflicts and completed merge"
+                else
+                  echo "ERROR: Failed to commit resolved merge conflicts"
+                  echo "Debugging information:"
+                  git status
+                  echo "Conflicted files:"
+                  git diff --name-only --diff-filter=U
+                  exit 1
+                fi
+              else
+                echo "ERROR: Merge failed but no conflicts detected. Check git status."
+                git status
+                exit 1
+              fi
+            else
+              echo "Successfully merged master into avalara-dev (no conflicts)"
+            fi
+          fi
+      
+      - name: Setup and Build
+        uses: ./.github/actions/setup-nodejs
+        with:
+          install-command: 'pnpm install'
+      
+      - name: Verify avalara environment variables
+        run: |
+          echo "=== AVALARA ENVIRONMENT VARIABLES VERIFICATION ==="
+          echo "Verifying avalara environment variables in current branch (avalara-dev)"
+          
+          # Check for required environment variables
+          echo " Checking for required environment variables..."
+          
+          ERROR_COUNT=0
+          
+          # Check for N8N_MIN_SCHEDULE_INTERVAL_SECONDS
+          if git grep -q "N8N_MIN_SCHEDULE_INTERVAL_SECONDS"; then
+            echo " Found: N8N_MIN_SCHEDULE_INTERVAL_SECONDS environment variable"
+          else
+            echo " Missing: N8N_MIN_SCHEDULE_INTERVAL_SECONDS environment variable"
+            ERROR_COUNT=$((ERROR_COUNT + 1))
+          fi
+          
+          # Show environment variable definitions found
+          echo " Environment variable definitions found:"
+          git grep -n "N8N_MIN_SCHEDULE_INTERVAL_SECONDS" | head -10 || echo "  No environment variables found"
+          
+          # Final verification summary
+          echo ""
+          echo " VERIFICATION SUMMARY:"
+          echo "  - Errors found: $ERROR_COUNT"
+          
+          if [ $ERROR_COUNT -eq 0 ]; then
+            echo " AVALARA ENVIRONMENT VARIABLES VERIFICATION PASSED - All required environment variables are present!"
+          else
+            echo " AVALARA ENVIRONMENT VARIABLES VERIFICATION FAILED - $ERROR_COUNT errors found!"
+            echo ""
+            echo "The avalara-dev branch is missing required environment variables."
+            echo "Cannot push without avalara features. Aborting push."
+            exit 1
+          fi
+      
+      - name: Push avalara-dev branch
+        run: |
+          git push origin avalara-dev
+        env:
+          GITHUB_TOKEN: ${{ secrets.SYNC_PAT }}
+
+  # Mirror the latest upstream release/2.X.X branch into a fork
+  # `latest-release` branch and verify it builds and tests pass.
+  # This gates build_avalara_release so that the upstream release is
+  # known-good before we attempt to apply the avalara delta on top.
+  build_latest_release:
+    runs-on: ubuntu-latest
+    needs: [sync_automation, sync_master]
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0 # we need history to work with branches
+          token: ${{ secrets.SYNC_PAT }}
+
+      - name: Configure Git user
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Refresh latest-release from latest upstream release/2.X.X
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Add upstream remote if it doesn't exist
+          if ! git remote get-url upstream >/dev/null 2>&1; then
+            git remote add upstream https://github.com/n8n-io/n8n.git
+          fi
+
+          echo "Discovering latest upstream release/2.X.X branch..."
+          LATEST_RELEASE_BRANCH=$(git ls-remote --refs upstream 'refs/heads/release/2.*' \
+            | awk '{print $2}' \
+            | sed 's|refs/heads/||' \
+            | sort -V \
+            | tail -1)
+
+          if [ -z "$LATEST_RELEASE_BRANCH" ]; then
+            echo "ERROR: No upstream release/2.X.X branches found"
+            exit 1
+          fi
+
+          echo "Latest upstream release branch: $LATEST_RELEASE_BRANCH"
+
+          # Fetch only the chosen release branch
+          git fetch upstream "$LATEST_RELEASE_BRANCH":"refs/remotes/upstream/$LATEST_RELEASE_BRANCH"
+
+          # Expose the chosen branch to subsequent steps
+          echo "LATEST_RELEASE_BRANCH=$LATEST_RELEASE_BRANCH" >> "$GITHUB_ENV"
+
+          echo "Resetting latest-release to upstream/$LATEST_RELEASE_BRANCH..."
+          git checkout -B latest-release "upstream/$LATEST_RELEASE_BRANCH"
+          git reset --hard "upstream/$LATEST_RELEASE_BRANCH"
+          git clean -fd
+
+          echo "Successfully reset latest-release to upstream/$LATEST_RELEASE_BRANCH"
+
+      - name: Setup and Build
+        uses: ./.github/actions/setup-nodejs
+
+      - name: Verify package.json version matches upstream release branch
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "=== PACKAGE.JSON VERSION VERIFICATION ==="
+
+          if [ -z "${LATEST_RELEASE_BRANCH:-}" ]; then
+            echo "ERROR: LATEST_RELEASE_BRANCH is not set. The refresh step must run first."
+            exit 1
+          fi
+
+          echo "Verifying package.json version consistency with upstream/$LATEST_RELEASE_BRANCH"
+
+          git fetch upstream "$LATEST_RELEASE_BRANCH":"refs/remotes/upstream/$LATEST_RELEASE_BRANCH"
+
+          LATEST_RELEASE_VERSION=$(git show "HEAD:package.json" | grep '"version"' | head -1 | sed 's/.*"version": *"\([^"]*\)".*/\1/')
+          UPSTREAM_RELEASE_VERSION=$(git show "upstream/$LATEST_RELEASE_BRANCH:package.json" | grep '"version"' | head -1 | sed 's/.*"version": *"\([^"]*\)".*/\1/')
+
+          echo "latest-release version: $LATEST_RELEASE_VERSION"
+          echo "upstream/$LATEST_RELEASE_BRANCH version: $UPSTREAM_RELEASE_VERSION"
+
+          if [ "$LATEST_RELEASE_VERSION" = "$UPSTREAM_RELEASE_VERSION" ]; then
+            echo "VERSION MATCH: latest-release version ($LATEST_RELEASE_VERSION) matches upstream/$LATEST_RELEASE_BRANCH ($UPSTREAM_RELEASE_VERSION)"
+          else
+            echo "VERSION MISMATCH: latest-release ($LATEST_RELEASE_VERSION) != upstream/$LATEST_RELEASE_BRANCH ($UPSTREAM_RELEASE_VERSION)"
+            exit 1
+          fi
+
+      - name: Push refreshed latest-release branch
+        run: |
+          echo "Pushing refreshed latest-release to origin..."
+          if ! git push origin latest-release --force; then
+            echo "ERROR: Failed to push latest-release to origin. Check permissions and network connectivity."
+            exit 1
+          fi
+
+          echo "Successfully pushed refreshed latest-release branch"
+        env:
+          GITHUB_TOKEN: ${{ secrets.SYNC_PAT }}
+
+  build_avalara_release:
+    runs-on: ubuntu-latest
+    needs: [sync_automation, sync_master, sync_avalara_dev, build_latest_release]
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0 # we need history to work with branches
+          token: ${{ secrets.SYNC_PAT }}
+
+      - name: Configure Git user
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Refresh avalara-release from latest upstream release/2.X.X
+        run: |
+          git fetch --all
+
+          # Add upstream remote if it doesn't exist
+          if ! git remote get-url upstream >/dev/null 2>&1; then
+            git remote add upstream https://github.com/n8n-io/n8n.git
+          fi
+
+          # Discover the latest release/2.X.X branch on upstream
+          echo "Discovering latest upstream release/2.X.X branch..."
+          LATEST_RELEASE_BRANCH=$(git ls-remote --refs upstream 'refs/heads/release/2.*' \
+            | awk '{print $2}' \
+            | sed 's|refs/heads/||' \
+            | sort -V \
+            | tail -1)
+
+          if [ -z "$LATEST_RELEASE_BRANCH" ]; then
+            echo "ERROR: No upstream release/2.X.X branches found"
+            exit 1
+          fi
+
+          echo "Latest upstream release branch: $LATEST_RELEASE_BRANCH"
+
+          # Fetch only the chosen release branch (and master, used elsewhere in the job)
+          git fetch upstream master "$LATEST_RELEASE_BRANCH":"refs/remotes/upstream/$LATEST_RELEASE_BRANCH"
+
+          # Expose the chosen branch to subsequent steps
+          echo "LATEST_RELEASE_BRANCH=$LATEST_RELEASE_BRANCH" >> "$GITHUB_ENV"
+
+          # Check if avalara-release branch exists, create it if not
+          if git show-ref --verify --quiet "refs/remotes/origin/avalara-release"; then
+            echo "Remote avalara-release branch exists"
+          else
+            echo "Remote avalara-release branch does not exist, will create it from upstream/$LATEST_RELEASE_BRANCH"
+          fi
+
+          # Reset avalara-release from the latest upstream release branch
+          echo "Resetting avalara-release to upstream/$LATEST_RELEASE_BRANCH..."
+          git checkout -B avalara-release "upstream/$LATEST_RELEASE_BRANCH"
+          git reset --hard "upstream/$LATEST_RELEASE_BRANCH"
+          git clean -fd
+
+          echo "Successfully reset avalara-release to upstream/$LATEST_RELEASE_BRANCH"
+
+      # Minimal pnpm/Node provisioning to run `pnpm install --lockfile-only`
+      # in the next step. We deliberately avoid the full setup-nodejs
+      # composite here because it also starts a Turborepo cache server and
+      # configures pnpm-store caching — running those twice in the same job
+      # (once here, once in `Setup and Build` below) makes the first
+      # cache server unreachable at post-job cleanup ("fetch failed").
+      - name: Setup pnpm (lockfile regeneration only)
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+
+      - name: Setup Node.js (lockfile regeneration only)
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: '24.15.0'
+
+      - name: Port avalara feature delta from avalara-dev
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Porting avalara feature delta from avalara-dev..."
+          git fetch origin avalara-dev
+          git fetch upstream master  # base for the avalara delta
+
+          # avalara-dev = upstream/master + avalara feature changes.
+          # The diff between them is the precise avalara delta.
+          # We apply that diff as a patch (with 3-way merge) onto
+          # the release branch, so only avalara additions land here,
+          # without dragging in unrelated master-side context that the
+          # whole-file copy approach would introduce.
+          #
+          # Lockfiles are excluded: the release branch's lockfile is shaped
+          # for upstream/release/2.X.X deps, so applying lockfile hunks
+          # from avalara-dev (shaped for master) rarely merges cleanly. We
+          # regenerate pnpm-lock.yaml below from the patched manifests so
+          # the release branch keeps its dep versions while picking up any
+          # avalara manifest customizations.
+          PATCH="$RUNNER_TEMP/avalara-feature.patch"
+          git diff upstream/master..origin/avalara-dev \
+            -- ':(exclude)pnpm-lock.yaml' \
+               ':(exclude)*.lock' \
+            > "$PATCH"
+
+          if [ ! -s "$PATCH" ]; then
+            echo "No avalara feature delta to apply; nothing to do."
+            rm -f "$PATCH"
+            exit 0
+          fi
+
+          echo "Patch summary:"
+          git apply --stat "$PATCH"
+
+          # 3-way merge resolves context drift between upstream/master
+          # (the base avalara-dev was authored on) and the release branch.
+          #
+          # Some files deleted in avalara-dev vs master may never have existed
+          # on the release branch (e.g. test files added to master after the
+          # release was cut). Trying to delete something that isn't in the
+          # index is a fatal error, even though the end state is identical
+          # (file absent). We detect those files and exclude them from apply.
+          APPLY_ARGS=(--3way --whitespace=fix)
+          DELETED_IN_PATCH=$(awk '/^diff --git/{f=$3; sub(/^a\//,"",f)} /^deleted file mode/{print f}' "$PATCH")
+          if [ -n "$DELETED_IN_PATCH" ]; then
+            while IFS= read -r f; do
+              if ! git ls-files --error-unmatch "$f" >/dev/null 2>&1; then
+                echo "  Skipping deletion of file absent from release branch: $f"
+                APPLY_ARGS+=(--exclude="$f")
+              fi
+            done <<< "$DELETED_IN_PATCH"
+          fi
+
+          if ! git apply "${APPLY_ARGS[@]}" "$PATCH"; then
+            echo "ERROR: avalara feature port failed to apply cleanly on release branch."
+            echo "Working tree status:"
+            git status
+            echo "Whitespace/conflict check:"
+            git diff --check || true
+            rm -f "$PATCH"
+            exit 1
+          fi
+
+          rm -f "$PATCH"
+
+          # If any package.json changed, regenerate pnpm-lock.yaml against
+          # the release branch's now-merged manifests so the lockfile stays
+          # internally consistent with package.json (required for later
+          # `pnpm install --frozen-lockfile`).
+          if git status --porcelain | grep -E '(^|/)package\.json$' >/dev/null; then
+            echo "package.json changes detected; regenerating pnpm-lock.yaml..."
+            pnpm install --lockfile-only
+          else
+            echo "No package.json changes; skipping pnpm-lock.yaml regeneration."
+          fi
+
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Patch produced no changes; skipping commit."
+          else
+            git commit -m "feat: apply avalara feature changes from avalara-dev"
+            echo "Committed avalara feature delta to avalara-release."
+          fi
+      
+      - name: Setup and Build
+        uses: ./.github/actions/setup-nodejs
+
+      - name: Compute avalara delta vs latest-release
+        id: changed-files
+        run: |
+          # avalara-release = latest-release (upstream release/2.X.X) + the
+          # avalara feature delta. Diffing against latest-release isolates that
+          # delta, so we only test what our changes touch — not the entire
+          # upstream release, which already passed upstream CI.
+          git fetch --no-tags --prune origin latest-release
+          CHANGED="$(git diff --name-only --merge-base origin/latest-release HEAD)"
+          echo "Changed files vs latest-release:"
+          echo "$CHANGED"
+          {
+            echo "list<<EOF"
+            echo "$CHANGED"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Compute changed packages
+        id: affected-packages
+        env:
+          CHANGED_FILES: ${{ steps.changed-files.outputs.list }}
+        run: |
+          # Map each changed file to its owning workspace package (nearest
+          # package.json with a name), ignoring the root package.json and the
+          # lockfile so a routine lockfile regen doesn't fan out to everything.
+          # We deliberately do NOT use `janitor affected-packages` here: the
+          # upstream release branch ships an older janitor without that
+          # subcommand, which silently falls through to the analyzer.
+          PACKAGES=$(node -e '
+          const fs = require("fs");
+          const path = require("path");
+          const raw = process.env.CHANGED_FILES || "";
+          const files = raw.split(/\s+/).map((s) => s.trim()).filter(Boolean)
+            .filter((f) => f !== "package.json" && f !== "pnpm-lock.yaml");
+          const names = new Set();
+          for (const f of files) {
+            let dir = path.dirname(f);
+            while (dir && dir !== "." && dir !== "/") {
+              const pj = path.join(dir, "package.json");
+              if (fs.existsSync(pj)) {
+                try {
+                  const n = JSON.parse(fs.readFileSync(pj, "utf8")).name;
+                  if (n) { names.add(n); break; }
+                } catch (e) {}
+              }
+              dir = path.dirname(dir);
+            }
+          }
+          process.stdout.write([...names].join(" "));
+          ')
+          echo "Changed packages: $PACKAGES"
+          echo "list=$PACKAGES" >> "$GITHUB_OUTPUT"
+
+      - name: Run unit tests (scoped to avalara delta)
+        env:
+          AFFECTED_PACKAGES: ${{ steps.affected-packages.outputs.list }}
+        run: |
+          if [ -z "$(printf '%s' "$AFFECTED_PACKAGES" | tr -d '[:space:]')" ]; then
+            echo "No packages changed by the avalara delta; skipping tests."
+            exit 0
+          fi
+          FILTERS=()
+          for pkg in $AFFECTED_PACKAGES; do
+            FILTERS+=("--filter=$pkg")
+          done
+          echo "Turbo filters:${FILTERS[*]}"
+          # Run the unit suites of the changed packages. test:unit covers the
+          # backend packages that carry the avalara logic (e.g. @n8n/config,
+          # n8n-core); turbo skips filtered packages that don't define it.
+          # Full nodes-base / editor-ui suites are intentionally not run for
+          # peripheral (test-helper / version-bump) changes.
+          pnpm turbo run test:unit --continue "${FILTERS[@]}"
+
+      - name: Verify avalara environment variables
+        run: |
+          echo "=== AVALARA ENVIRONMENT VARIABLES VERIFICATION ==="
+          echo "Verifying avalara environment variables in current branch (avalara-release)"
+          
+          # Check for required environment variables
+          echo " Checking for required environment variables..."
+          
+          ERROR_COUNT=0
+          
+          # Check for N8N_MIN_SCHEDULE_INTERVAL_SECONDS
+          if git grep -q "N8N_MIN_SCHEDULE_INTERVAL_SECONDS"; then
+            echo " Found: N8N_MIN_SCHEDULE_INTERVAL_SECONDS environment variable"
+          else
+            echo " Missing: N8N_MIN_SCHEDULE_INTERVAL_SECONDS environment variable"
+            ERROR_COUNT=$((ERROR_COUNT + 1))
+          fi
+          
+          # Show environment variable definitions found
+          echo " Environment variable definitions found:"
+          git grep -n "N8N_MIN_SCHEDULE_INTERVAL_SECONDS" | head -10 || echo "  No environment variables found"
+          
+          # Final verification summary
+          echo ""
+          echo " VERIFICATION SUMMARY:"
+          echo "  - Errors found: $ERROR_COUNT"
+          
+          if [ $ERROR_COUNT -eq 0 ]; then
+            echo " AVALARA ENVIRONMENT VARIABLES VERIFICATION PASSED - All required environment variables are present!"
+          else
+            echo " AVALARA ENVIRONMENT VARIABLES VERIFICATION FAILED - $ERROR_COUNT errors found!"
+            echo ""
+            echo "The avalara-release branch is missing required environment variables."
+            echo "Cannot push without avalara features. Aborting push."
+            exit 1
+          fi
+      
+      - name: Verify package.json version matches upstream release branch
+        run: |
+          echo "=== PACKAGE.JSON VERSION VERIFICATION ==="
+
+          if [ -z "${LATEST_RELEASE_BRANCH:-}" ]; then
+            echo "ERROR: LATEST_RELEASE_BRANCH is not set. The refresh step must run first."
+            exit 1
+          fi
+
+          echo "Verifying package.json version consistency with upstream/$LATEST_RELEASE_BRANCH"
+
+          # Ensure we have the upstream release branch locally
+          git fetch upstream "$LATEST_RELEASE_BRANCH":"refs/remotes/upstream/$LATEST_RELEASE_BRANCH"
+
+          # Extract version from avalara-release package.json (current branch)
+          echo "Extracting version from avalara-release package.json..."
+          AVALARA_RELEASE_VERSION=$(git show "HEAD:package.json" | grep '"version"' | head -1 | sed 's/.*"version": *"\([^"]*\)".*/\1/')
+
+          # Extract version from upstream release branch package.json
+          echo "Extracting version from upstream/$LATEST_RELEASE_BRANCH package.json..."
+          RELEASE_VERSION=$(git show "upstream/$LATEST_RELEASE_BRANCH:package.json" | grep '"version"' | head -1 | sed 's/.*"version": *"\([^"]*\)".*/\1/')
+
+          echo "avalara-release version: $AVALARA_RELEASE_VERSION"
+          echo "upstream/$LATEST_RELEASE_BRANCH version: $RELEASE_VERSION"
+
+          # Compare versions
+          if [ "$AVALARA_RELEASE_VERSION" = "$RELEASE_VERSION" ]; then
+            echo "VERSION MATCH: avalara-release version ($AVALARA_RELEASE_VERSION) matches upstream/$LATEST_RELEASE_BRANCH version ($RELEASE_VERSION)"
+            echo "PACKAGE.JSON VERSION VERIFICATION PASSED - Versions are consistent!"
+          else
+            echo "VERSION MISMATCH: avalara-release version ($AVALARA_RELEASE_VERSION) does not match upstream/$LATEST_RELEASE_BRANCH version ($RELEASE_VERSION)"
+            echo ""
+            echo "The avalara-release branch has a different package.json version than upstream/$LATEST_RELEASE_BRANCH."
+            echo "This indicates the refresh process may not have completed correctly."
+            exit 1
+          fi
+      
+      - name: Push refreshed avalara-release branch
+        run: |
+          # Push the refreshed branch only if verification passes
+          echo "Pushing refreshed avalara-release to origin..."
+          if ! git push origin avalara-release --force; then
+            echo "ERROR: Failed to push avalara-release to origin. Check permissions and network connectivity."
+            exit 1
+          fi
+          
+          echo "Successfully pushed refreshed avalara-release branch"
+        env:
+          GITHUB_TOKEN: ${{ secrets.SYNC_PAT }}
+
+  # Final summary: report each refreshed branch and its package.json version.
+  # Runs even if upstream jobs failed so partial refreshes are still visible.
+  summary:
+    needs:
+      - sync_automation
+      - sync_master
+      - sync_avalara_dev
+      - build_latest_release
+      - build_avalara_release
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+          token: ${{ secrets.SYNC_PAT }}
+
+      - name: Print refreshed branches and package.json versions
+        shell: bash
+        run: |
+          set +e
+          echo "=== AVALARA SYNC SUMMARY ==="
+          echo ""
+
+          echo "Job results:"
+          echo "  sync_automation:       ${{ needs.sync_automation.result }}"
+          echo "  sync_master:           ${{ needs.sync_master.result }}"
+          echo "  sync_avalara_dev:      ${{ needs.sync_avalara_dev.result }}"
+          echo "  build_latest_release:  ${{ needs.build_latest_release.result }}"
+          echo "  build_avalara_release: ${{ needs.build_avalara_release.result }}"
+          echo ""
+
+          BRANCHES=(automation master avalara-dev latest-release avalara-release)
+
+          # Refresh remote-tracking refs for each branch
+          for branch in "${BRANCHES[@]}"; do
+            git fetch --quiet origin "$branch" || true
+          done
+
+          declare -A JOB_RESULT
+          JOB_RESULT[automation]="${{ needs.sync_automation.result }}"
+          JOB_RESULT[master]="${{ needs.sync_master.result }}"
+          JOB_RESULT[avalara-dev]="${{ needs.sync_avalara_dev.result }}"
+          JOB_RESULT[latest-release]="${{ needs.build_latest_release.result }}"
+          JOB_RESULT[avalara-release]="${{ needs.build_avalara_release.result }}"
+
+          {
+            echo "## Avalara sync summary"
+            echo ""
+            echo "| Branch | Job result | Version | Commit | Subject |"
+            echo "| --- | --- | --- | --- | --- |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          printf "%-18s  %-12s  %-12s  %-14s  %s\n" "Branch" "Job result" "Version" "Commit" "Subject"
+          printf "%-18s  %-12s  %-12s  %-14s  %s\n" "------------------" "------------" "------------" "--------------" "-------"
+
+          for branch in "${BRANCHES[@]}"; do
+            result="${JOB_RESULT[$branch]:-unknown}"
+            if git show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+              version=$(git show "origin/$branch:package.json" 2>/dev/null \
+                | grep '"version"' | head -1 \
+                | sed 's/.*"version": *"\([^"]*\)".*/\1/')
+              sha=$(git rev-parse --short=12 "origin/$branch")
+              subject=$(git log -1 --pretty=%s "origin/$branch")
+              printf "%-18s  %-12s  %-12s  %-14s  %s\n" \
+                "$branch" "$result" "${version:-<none>}" "$sha" "$subject"
+              echo "| \`$branch\` | $result | \`${version:-<none>}\` | \`$sha\` | $subject |" \
+                >> "$GITHUB_STEP_SUMMARY"
+            else
+              printf "%-18s  %-12s  %-12s  %-14s  %s\n" \
+                "$branch" "$result" "<missing>" "-" "-"
+              echo "| \`$branch\` | $result | _missing_ | - | - |" \
+                >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
